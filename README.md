@@ -20,11 +20,6 @@ Using **Hugging Face open models (Qwen2.5-Instruct)**, **Streamlit**, and **Duck
 
 ---
 
-🎥 **Demo Video:**  
-👉 Video attached in the repository
-
----
-
 ## 🔍 What I Learned
 
 This project was a great way to explore:
