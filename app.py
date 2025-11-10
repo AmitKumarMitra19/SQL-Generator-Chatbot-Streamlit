@@ -1,11 +1,9 @@
-# app.py  — Streamlit LLM→SQL (HF InferenceClient, no secrets required)
-
 import os, re, json
 import pandas as pd
 import duckdb
 import sqlglot
 import streamlit as st
-from huggingface_hub import InferenceClient  # NEW: official client
+from huggingface_hub import InferenceClient  # Official client for router
 
 # --------------------------
 # Safe getters (ENV or empty)
@@ -20,7 +18,7 @@ DEFAULT_TOKEN = safe_get_env("HF_TOKEN", "")
 # UI
 # --------------------------
 st.set_page_config(page_title="LLM → SQL", page_icon="🧠", layout="wide")
-st.title("🧠→🗄️  LLM SQL Generator (HF InferenceClient)")
+st.title("🧠→🗄️  LLM SQL Generator (Hugging Face Router)")
 
 with st.sidebar:
     st.subheader("LLM Settings")
@@ -29,7 +27,7 @@ with st.sidebar:
     temp = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
     max_tokens = st.slider("Max new tokens", 64, 2048, 512, 64)
     dialect = st.selectbox("SQL Dialect", ["postgres", "duckdb", "mysql", "sqlite", "bigquery", "snowflake"], index=0)
-    st.caption("Tip: Paste your Hugging Face token here at runtime.")
+    st.caption("Paste your Hugging Face token here (required for model access).")
 
 # --------------------------
 # Prompting
@@ -60,7 +58,6 @@ ORDER BY 1;"""
 ]
 
 def build_messages(schema: str, question: str, dialect: str):
-    # OpenAI-style messages for HF router
     messages = [{"role": "system", "content": SQL_SYSTEM_PROMPT}]
     for ex in FEWSHOTS:
         messages.append({
@@ -71,8 +68,7 @@ def build_messages(schema: str, question: str, dialect: str):
         messages.append({"role": "assistant", "content": f"```sql\n{ex['sql'].strip()}\n```"})
     messages.append({
         "role": "user",
-        "content": f"SQL DIALECT: {dialect}\nSCHEMA:\n{schema.strip()}\n\n"
-                   f"QUESTION: {question.strip()}\nReturn only SQL."
+        "content": f"SQL DIALECT: {dialect}\nSCHEMA:\n{schema.strip()}\n\nQUESTION: {question.strip()}\nReturn only SQL."
     })
     return messages
 
@@ -90,22 +86,21 @@ def validate_sql(sql: str, dialect: str):
 def call_hf_chat(model_id: str, hf_token: str, messages: list,
                  max_new_tokens=512, temperature=0.2, top_p=0.95, timeout=60):
     """
-    Uses HF Inference Providers via the official client.
-    This avoids deprecated endpoints and speaks the new router.
+    Uses the new Hugging Face Router via InferenceClient.
+    No manual URL required; handles chat completions automatically.
     """
     if not hf_token:
         raise RuntimeError("Missing HF token. Paste it in the sidebar.")
-    client = InferenceClient(model=model_id, token=hf_token.strip(), timeout=timeout, provider="hf-inference")
-    out = client.chat_completion(
+
+    client = InferenceClient(model=model_id, token=hf_token.strip(), timeout=timeout)
+    response = client.chat.completions.create(
+        model=model_id,
         messages=messages,
         temperature=temperature,
         max_tokens=max_new_tokens,
         top_p=top_p,
     )
-    if hasattr(out, "choices"):
-        return out.choices[0].message.get("content") or ""
-    # Streamed generator fallback: concatenate deltas
-    return "".join(chunk.choices[0].delta.get("content", "") for chunk in out)
+    return response.choices[0].message.content
 
 # --------------------------
 # Main UI
@@ -165,4 +160,3 @@ if files:
             st.dataframe(res)
         except Exception as e:
             st.error(f"Execution error: {e}")
-
