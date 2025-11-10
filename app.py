@@ -1,44 +1,39 @@
-import os, re, json, requests
-import sqlglot
-import duckdb
+# app.py  — Streamlit LLM→SQL (HF InferenceClient, no secrets required)
+
+import os, re, json
 import pandas as pd
+import duckdb
+import sqlglot
 import streamlit as st
+from huggingface_hub import InferenceClient  # NEW: official client
 
 # --------------------------
-# Secrets/ENV-safe getters
+# Safe getters (ENV or empty)
 # --------------------------
-def safe_get_secret(name: str, default=None):
-    # Try Streamlit secrets if available, else ENV, else default
-    try:
-        return st.secrets[name]
-    except Exception:
-        return os.environ.get(name, default)
+def safe_get_env(name: str, default=None):
+    return os.environ.get(name, default)
 
-# Defaults (can be overridden by user input below)
-DEFAULT_MODEL = safe_get_secret("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-DEFAULT_TOKEN = safe_get_secret("HF_TOKEN", None)
+DEFAULT_MODEL = safe_get_env("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+DEFAULT_TOKEN = safe_get_env("HF_TOKEN", "")
 
 # --------------------------
 # UI
 # --------------------------
 st.set_page_config(page_title="LLM → SQL", page_icon="🧠", layout="wide")
-st.title("🧠→🗄️  LLM SQL Generator (Open-source LLM via HF)")
+st.title("🧠→🗄️  LLM SQL Generator (HF InferenceClient)")
 
 with st.sidebar:
-    st.subheader("LLM Settings (no secrets required)")
+    st.subheader("LLM Settings")
     model = st.text_input("HF Model", value=DEFAULT_MODEL, help="e.g. Qwen/Qwen2.5-7B-Instruct")
-    token = st.text_input("HF Token (paste here)", type="password", value=DEFAULT_TOKEN if DEFAULT_TOKEN else "")
+    token = st.text_input("HF Token (paste here)", type="password", value=DEFAULT_TOKEN)
     temp = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
     max_tokens = st.slider("Max new tokens", 64, 2048, 512, 64)
     dialect = st.selectbox("SQL Dialect", ["postgres", "duckdb", "mysql", "sqlite", "bigquery", "snowflake"], index=0)
-    st.caption("Tip: Paste your Hugging Face token here at runtime if you don't want to use Streamlit Secrets.")
+    st.caption("Tip: Paste your Hugging Face token here at runtime.")
 
-HF_API_URL = st.text_input(
-    "HF Inference API URL",
-    value=f"https://api-inference.huggingface.co/models/{model}",
-    help="Advanced: set your own endpoint (e.g., a public Space) if you want to avoid tokens."
-)
-
+# --------------------------
+# Prompting
+# --------------------------
 SQL_SYSTEM_PROMPT = """You are a senior data analyst who writes correct, executable SQL.
 Follow the user's SQL dialect strictly. Return ONLY the SQL code (inside a code block) unless asked.
 Prefer explicit column lists over SELECT * when reasonable.
@@ -52,60 +47,34 @@ FEWSHOTS = [
         Table orders(id INT PRIMARY KEY, customer_id INT, order_date DATE, total NUMERIC);
         """,
         "dialect": "postgres",
-        "question": "Total revenue by country for 2024?",
-        "sql": """-- Assumption: revenue measured by orders.total; 2024 calendar year
-SELECT c.country, SUM(o.total) AS total_revenue
-FROM customers c
-JOIN orders o ON o.customer_id = c.id
-WHERE o.order_date >= DATE '2024-01-01'
-  AND o.order_date <  DATE '2025-01-01'
-GROUP BY c.country
-ORDER BY total_revenue DESC;"""
+        "question": "Monthly revenue for 2025 (completed only), month as YYYY-MM",
+        "sql": """-- Completed orders only; Postgres date_trunc and to_char
+SELECT to_char(date_trunc('month', order_date), 'YYYY-MM') AS month,
+       SUM(total) AS revenue
+FROM orders
+WHERE order_date >= DATE '2025-01-01'
+  AND order_date <  DATE '2026-01-01'
+GROUP BY 1
+ORDER BY 1;"""
     }
 ]
 
-def build_chat_prompt(schema: str, question: str, dialect: str) -> str:
-    parts = [f"[SYSTEM]\n{SQL_SYSTEM_PROMPT}\n[/SYSTEM]"]
+def build_messages(schema: str, question: str, dialect: str):
+    # OpenAI-style messages for HF router
+    messages = [{"role": "system", "content": SQL_SYSTEM_PROMPT}]
     for ex in FEWSHOTS:
-        parts.append(
-            "[USER]\n"
-            f"SQL DIALECT: {ex['dialect']}\nSCHEMA:\n{ex['schema'].strip()}\n"
-            f"QUESTION: {ex['question']}\nReturn only SQL.\n[/USER]"
-        )
-        parts.append(f"[ASSISTANT]\n```sql\n{ex['sql'].strip()}\n```\n[/ASSISTANT]")
-    parts.append(
-        "[USER]\n"
-        f"SQL DIALECT: {dialect}\nSCHEMA:\n{schema.strip()}\n\n"
-        f"QUESTION: {question.strip()}\nReturn only SQL.\n[/USER]"
-    )
-    return "\n".join(parts)
-
-def call_hf_inference(api_url: str, hf_token: str, prompt: str,
-                      max_new_tokens=512, temperature=0.2, top_p=0.95, timeout=60):
-    headers = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "return_full_text": False
-        }
-    }
-    resp = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
-    # Nice errors
-    try:
-        resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}") from e
-    data = resp.json()
-    if isinstance(data, list) and data and "generated_text" in data[0]:
-        return data[0]["generated_text"]
-    if isinstance(data, dict) and "error" in data:
-        raise RuntimeError(f"Inference error: {data['error']}")
-    return json.dumps(data)
+        messages.append({
+            "role": "user",
+            "content": f"SQL DIALECT: {ex['dialect']}\nSCHEMA:\n{ex['schema'].strip()}\n"
+                       f"QUESTION: {ex['question']}\nReturn only SQL."
+        })
+        messages.append({"role": "assistant", "content": f"```sql\n{ex['sql'].strip()}\n```"})
+    messages.append({
+        "role": "user",
+        "content": f"SQL DIALECT: {dialect}\nSCHEMA:\n{schema.strip()}\n\n"
+                   f"QUESTION: {question.strip()}\nReturn only SQL."
+    })
+    return messages
 
 def extract_sql(text: str) -> str:
     m = re.search(r"```(?:sql)?\s*(.*?)```", text, re.S | re.I)
@@ -118,16 +87,48 @@ def validate_sql(sql: str, dialect: str):
     except Exception as e:
         return False, str(e)
 
-st.markdown("**Paste your schema (DDL or plain description), enter a question, and generate SQL.**")
-schema = st.text_area("Schema", height=220, placeholder="Table users(id INT, name TEXT, created_at TIMESTAMP);\nTable events(id INT, user_id INT, type TEXT, ts TIMESTAMP);")
-question = st.text_area("Question", height=120, placeholder="Monthly active users in 2025, by month.")
+def call_hf_chat(model_id: str, hf_token: str, messages: list,
+                 max_new_tokens=512, temperature=0.2, top_p=0.95, timeout=60):
+    """
+    Uses HF Inference Providers via the official client.
+    This avoids deprecated endpoints and speaks the new router.
+    """
+    if not hf_token:
+        raise RuntimeError("Missing HF token. Paste it in the sidebar.")
+    client = InferenceClient(model=model_id, token=hf_token.strip(), timeout=timeout, provider="hf-inference")
+    out = client.chat_completion(
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_new_tokens,
+        top_p=top_p,
+    )
+    if hasattr(out, "choices"):
+        return out.choices[0].message.get("content") or ""
+    # Streamed generator fallback: concatenate deltas
+    return "".join(chunk.choices[0].delta.get("content", "") for chunk in out)
 
+# --------------------------
+# Main UI
+# --------------------------
+st.markdown("**Paste your schema (DDL or plain description), enter a question, and generate SQL.**")
+schema = st.text_area(
+    "Schema",
+    height=220,
+    placeholder=(
+        "Table customers(customer_id BIGINT, first_name TEXT, last_name TEXT, email TEXT, country TEXT, signup_date DATE);\n"
+        "Table products(product_id BIGINT, product_name TEXT, category TEXT, unit_price NUMERIC);\n"
+        "Table orders(order_id BIGINT, customer_id BIGINT, order_ts TIMESTAMPTZ, status TEXT, total_amount NUMERIC);\n"
+        "Table order_items(order_item_id BIGINT, order_id BIGINT, product_id BIGINT, quantity INT, item_price NUMERIC);\n"
+        "-- customers.customer_id = orders.customer_id\n"
+        "-- orders.order_id = order_items.order_id\n"
+        "-- order_items.product_id = products.product_id"
+    )
+)
+question = st.text_area("Question", height=120, placeholder="Monthly revenue for 2025 for completed orders only, as YYYY-MM.")
 if st.button("Generate SQL"):
     try:
-        if not token and "api-inference.huggingface.co" in HF_API_URL:
-            st.warning("You are calling the HF Inference API without a token. Many models require auth and may return 401.")
-        prompt = build_chat_prompt(schema, question, dialect)
-        raw = call_hf_inference(HF_API_URL, token, prompt, max_new_tokens=max_tokens, temperature=temp)
+        messages = build_messages(schema, question, dialect)
+        raw = call_hf_chat(model, token, messages, max_new_tokens=max_tokens, temperature=temp)
         sql = extract_sql(raw)
         ok, err = validate_sql(sql, dialect)
         st.session_state.setdefault("history", [])
@@ -164,3 +165,4 @@ if files:
             st.dataframe(res)
         except Exception as e:
             st.error(f"Execution error: {e}")
+
